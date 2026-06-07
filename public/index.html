@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Guest Book</title>
+    <meta name="robots" content="index, follow" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial, sans-serif;
+        margin: 0;
+        padding: 2rem 1rem 4rem;
+        background: #fff;
+        color: #1a1a1a;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #16161a;
+          color: #e8e8ea;
+        }
+      }
+      header {
+        max-width: 680px;
+        margin: 0 auto 0.5rem;
+      }
+      header h1 {
+        margin: 0 0 0.25rem;
+      }
+      header p {
+        margin: 0;
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Guest Book</h1>
+      <p>Leave a note, say hello, or reply to someone. Be kind.</p>
+    </header>
+
+    <div id="guestbook"></div>
+
+    <!-- Same-origin: no data-api needed. -->
+    <script src="/embed.js" data-target="guestbook"></script>
+  </body>
+</html>
