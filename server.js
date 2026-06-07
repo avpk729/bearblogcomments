@@ -288,15 +288,32 @@ app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+// Liveness check. Stays up even while the DB is still connecting so the
+// platform healthcheck passes and we can read startup logs.
+let dbReady = false;
+app.get('/healthz', (req, res) => res.json({ ok: true, db: dbReady }));
 
-init()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`[guestbook] listening on port ${PORT}`);
-    });
-  })
-  .catch((err) => {
-    console.error('[guestbook] failed to initialize database:', err);
-    process.exit(1);
-  });
+// Start serving immediately so /healthz responds right away.
+app.listen(PORT, () => {
+  console.log(`[guestbook] listening on port ${PORT}`);
+  if (!process.env.DATABASE_URL) {
+    console.warn('[guestbook] WARNING: DATABASE_URL is not set. Add a Postgres plugin and reference its variable.');
+  }
+});
+
+// Connect to Postgres in the background, retrying instead of crashing.
+// A transient DB hiccup at boot shouldn't take down the whole service.
+async function connectWithRetry(attempt = 1) {
+  try {
+    await init();
+    dbReady = true;
+    console.log('[guestbook] database ready');
+  } catch (err) {
+    const delay = Math.min(30000, 2000 * 2 ** (attempt - 1));
+    console.error(
+      `[guestbook] database init failed (attempt ${attempt}): ${err.message}. Retrying in ${delay}ms`
+    );
+    setTimeout(() => connectWithRetry(attempt + 1), delay);
+  }
+}
+connectWithRetry();
