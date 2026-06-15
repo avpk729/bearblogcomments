@@ -1,14 +1,20 @@
 /*
- * Bear Blog Guestbook — embeddable widget.
+ * Bear Blog Comments — embeddable widget.
  *
- * Usage on your (upgraded) Bear Blog "Guest Book" page:
+ * Per-post comments (in your POST template):
+ *   <div id="comments"></div>
+ *   <script src="https://YOUR-APP.up.railway.app/embed.js"
+ *           data-site-id="YOUR_SITE_ID" data-mode="post" data-target="comments"></script>
  *
+ * Per-blog guestbook (in a PAGE):
  *   <div id="guestbook"></div>
- *   <script src="https://YOUR-APP.up.railway.app/embed.js" data-target="guestbook"></script>
+ *   <script src="https://YOUR-APP.up.railway.app/embed.js"
+ *           data-site-id="YOUR_SITE_ID" data-mode="guestbook" data-target="guestbook"></script>
  *
- * The script figures out the API base from its own URL, so you only ever
- * change the src. It renders directly into the page (no iframe) so it
- * inherits your blog's look while staying namespaced under .gbk-*.
+ * mode "post" threads comments by the page URL. mode "guestbook" uses one
+ * thread for the whole site. Optional data-thread-key pins a stable key (handy
+ * if you later rename a post's slug). The script derives the API base from its
+ * own src, so you only ever change the src + site-id.
  */
 (function () {
   'use strict';
@@ -17,18 +23,30 @@
   var apiBase =
     (script && script.getAttribute('data-api')) ||
     (script && script.src ? new URL(script.src).origin : window.location.origin);
+  var siteId = script && script.getAttribute('data-site-id');
+  var mode = (script && script.getAttribute('data-mode')) || 'guestbook';
+  var threadKeyOverride = script && script.getAttribute('data-thread-key');
   var targetId = script && script.getAttribute('data-target');
+
+  // Params identifying this thread, sent with every request.
+  function threadParams() {
+    var p = { site_id: siteId, mode: mode };
+    if (mode === 'post') p.page_url = window.location.href;
+    if (threadKeyOverride) p.thread_key = threadKeyOverride;
+    return p;
+  }
+  function qs(obj) {
+    return Object.keys(obj)
+      .filter(function (k) { return obj[k] != null && obj[k] !== ''; })
+      .map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]); })
+      .join('&');
+  }
 
   var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
   function escapeHtml(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return ESC[c];
-    });
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ESC[c]; });
   }
-  // Plain text -> safe HTML, preserving line breaks. No formatting allowed.
-  function textToHtml(s) {
-    return escapeHtml(s).replace(/\n/g, '<br>');
-  }
+  function textToHtml(s) { return escapeHtml(s).replace(/\n/g, '<br>'); }
 
   function timeAgo(iso) {
     var d = new Date(iso);
@@ -80,10 +98,9 @@
       if (window.turnstile) return resolve();
       var s = document.createElement('script');
       s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-      s.async = true;
-      s.defer = true;
+      s.async = true; s.defer = true;
       s.onload = function () { resolve(); };
-      s.onerror = function () { resolve(); }; // fail open to the server check
+      s.onerror = function () { resolve(); };
       document.head.appendChild(s);
     });
   }
@@ -100,37 +117,30 @@
   function GuestBook(root, config) {
     this.root = root;
     this.config = config;
-    this.widgets = {}; // turnstile widget ids keyed by form key
+    this.widgets = {};
     this.render();
   }
 
   GuestBook.prototype.render = function () {
-    var c = this.config;
     this.root.className = (this.root.className ? this.root.className + ' ' : '') + 'gbk';
-    this.root.innerHTML =
-      this.formHtml('main', 'Leave a note', null) +
-      '<div class="gbk-list"><p class="gbk-empty">Loading…</p></div>';
-    this.wireForm('main', null);
+    var formOrNote = this.config.accepting
+      ? this.formHtml('main', mode === 'guestbook' ? 'Leave a note' : 'Leave a comment', null)
+      : '<p class="gbk-empty">This ' + (mode === 'guestbook' ? 'guestbook' : 'comment section') + ' is not accepting new entries right now.</p>';
+    this.root.innerHTML = formOrNote + '<div class="gbk-list"><p class="gbk-empty">Loading…</p></div>';
+    if (this.config.accepting) this.wireForm('main', null);
     this.load();
   };
 
   GuestBook.prototype.formHtml = function (key, label, parentId) {
     var c = this.config;
     return (
-      '<form class="gbk-form" data-key="' + key + '"' +
-      (parentId ? ' data-parent="' + parentId + '"' : '') + '>' +
-      '<input class="gbk-name" name="name" type="text" maxlength="' + c.maxName +
-      '" placeholder="Your name (optional)" autocomplete="name">' +
-      '<textarea class="gbk-body" name="body" maxlength="' + c.maxBody +
-      '" placeholder="' + escapeHtml(label) + '…"></textarea>' +
-      // Honeypot — hidden from humans.
-      '<input class="gbk-hp" name="website" tabindex="-1" autocomplete="off" ' +
-      'style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" aria-hidden="true">' +
+      '<form class="gbk-form" data-key="' + key + '"' + (parentId ? ' data-parent="' + parentId + '"' : '') + '>' +
+      '<input class="gbk-name" name="name" type="text" maxlength="' + c.max_name + '" placeholder="Your name (optional)" autocomplete="name">' +
+      '<textarea class="gbk-body" name="body" maxlength="' + c.max_body + '" placeholder="' + escapeHtml(label) + '…"></textarea>' +
+      '<input class="gbk-hp" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0" aria-hidden="true">' +
       '<div class="gbk-captcha"></div>' +
-      '<div class="gbk-row">' +
-      '<span class="gbk-count">0 / ' + c.maxBody + '</span>' +
-      '<button class="gbk-btn" type="submit">Post</button>' +
-      '</div>' +
+      '<div class="gbk-row"><span class="gbk-count">0 / ' + c.max_body + '</span>' +
+      '<button class="gbk-btn" type="submit">Post</button></div>' +
       '<div class="gbk-msg" role="status"></div>' +
       '</form>'
     );
@@ -142,26 +152,16 @@
     if (!form) return;
     var body = form.querySelector('.gbk-body');
     var count = form.querySelector('.gbk-count');
-    var max = this.config.maxBody;
-
+    var max = this.config.max_body;
     body.addEventListener('input', function () {
       count.textContent = body.value.length + ' / ' + max;
       count.classList.toggle('over', body.value.length >= max);
     });
-
-    // Render a Turnstile widget into this form if configured.
-    if (this.config.siteKey && window.turnstile) {
+    if (this.config.turnstile_site_key && window.turnstile) {
       var holder = form.querySelector('.gbk-captcha');
-      this.widgets[key] = window.turnstile.render(holder, {
-        sitekey: this.config.siteKey,
-        theme: 'auto',
-      });
+      this.widgets[key] = window.turnstile.render(holder, { sitekey: this.config.turnstile_site_key, theme: 'auto' });
     }
-
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      self.submit(form, key, parentId);
-    });
+    form.addEventListener('submit', function (e) { e.preventDefault(); self.submit(form, key, parentId); });
   };
 
   GuestBook.prototype.submit = function (form, key, parentId) {
@@ -171,89 +171,60 @@
     var name = form.querySelector('.gbk-name').value;
     var body = form.querySelector('.gbk-body').value;
     var website = form.querySelector('.gbk-hp').value;
-
-    msg.className = 'gbk-msg';
-    msg.textContent = '';
-
-    if (!body.trim()) {
-      msg.className = 'gbk-msg err';
-      msg.textContent = 'Please write something first.';
-      return;
-    }
+    msg.className = 'gbk-msg'; msg.textContent = '';
+    if (!body.trim()) { msg.className = 'gbk-msg err'; msg.textContent = 'Please write something first.'; return; }
 
     var token = '';
-    if (this.config.siteKey && window.turnstile && this.widgets[key] != null) {
+    if (this.config.turnstile_site_key && window.turnstile && this.widgets[key] != null) {
       token = window.turnstile.getResponse(this.widgets[key]) || '';
-      if (!token) {
-        msg.className = 'gbk-msg err';
-        msg.textContent = 'Please complete the human check.';
-        return;
-      }
+      if (!token) { msg.className = 'gbk-msg err'; msg.textContent = 'Please complete the human check.'; return; }
     }
 
+    var payload = threadParams();
+    payload.name = name;
+    payload.body = body;
+    payload.parent_id = parentId;
+    payload.website = website;
+    payload.turnstileToken = token;
+
     btn.disabled = true;
-    api('/api/notes', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: name,
-        body: body,
-        parent_id: parentId,
-        website: website,
-        turnstileToken: token,
-      }),
-    })
+    api('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       .then(function () {
-        msg.className = 'gbk-msg ok';
-        msg.textContent = 'Posted — thanks!';
+        msg.className = 'gbk-msg ok'; msg.textContent = 'Posted — thanks!';
         form.querySelector('.gbk-body').value = '';
-        form.querySelector('.gbk-name').value = name; // keep their name
-        var count = form.querySelector('.gbk-count');
-        count.textContent = '0 / ' + self.config.maxBody;
-        if (self.config.siteKey && window.turnstile && self.widgets[key] != null) {
-          window.turnstile.reset(self.widgets[key]);
-        }
+        form.querySelector('.gbk-name').value = name;
+        form.querySelector('.gbk-count').textContent = '0 / ' + self.config.max_body;
+        if (self.config.turnstile_site_key && window.turnstile && self.widgets[key] != null) window.turnstile.reset(self.widgets[key]);
         self.load();
       })
-      .catch(function (err) {
-        msg.className = 'gbk-msg err';
-        msg.textContent = err.message || 'Something went wrong.';
-      })
-      .then(function () {
-        btn.disabled = false;
-      });
+      .catch(function (err) { msg.className = 'gbk-msg err'; msg.textContent = err.message || 'Something went wrong.'; })
+      .then(function () { btn.disabled = false; });
   };
 
   GuestBook.prototype.load = function () {
     var self = this;
     var list = this.root.querySelector('.gbk-list');
-    api('/api/notes', {})
+    api('/api/comments?' + qs(threadParams()), {})
       .then(function (data) {
-        var notes = data.notes || [];
+        var notes = data.comments || [];
         if (!notes.length) {
-          list.innerHTML = '<p class="gbk-empty">No notes yet. Be the first to sign the guestbook!</p>';
+          list.innerHTML = '<p class="gbk-empty">No comments yet.' + (self.config.accepting ? ' Be the first!' : '') + '</p>';
           return;
         }
         list.innerHTML = notes.map(function (n) { return self.noteHtml(n); }).join('');
         self.wireReplyButtons();
       })
-      .catch(function () {
-        list.innerHTML = '<p class="gbk-empty">Could not load the guestbook.</p>';
-      });
+      .catch(function () { list.innerHTML = '<p class="gbk-empty">Could not load comments.</p>'; });
   };
 
   GuestBook.prototype.noteHtml = function (n) {
     var self = this;
-    var replies = (n.replies || [])
-      .map(function (r) { return self.replyHtml(r); })
-      .join('');
+    var replies = (n.replies || []).map(function (r) { return self.replyHtml(r); }).join('');
     return (
       '<div class="gbk-note" data-id="' + n.id + '">' +
       '<div class="gbk-meta">' + this.metaHtml(n) + '</div>' +
       '<div class="gbk-text">' + textToHtml(n.body) + '</div>' +
-      '<div class="gbk-actions">' +
-      '<button class="gbk-link gbk-reply-btn" data-id="' + n.id + '">Reply</button>' +
-      '</div>' +
+      (this.config.accepting ? '<div class="gbk-actions"><button class="gbk-link gbk-reply-btn" data-id="' + n.id + '">Reply</button></div>' : '') +
       '<div class="gbk-reply-slot"></div>' +
       (replies ? '<div class="gbk-replies">' + replies + '</div>' : '') +
       '</div>'
@@ -279,16 +250,12 @@
 
   GuestBook.prototype.wireReplyButtons = function () {
     var self = this;
-    var btns = this.root.querySelectorAll('.gbk-reply-btn');
-    btns.forEach(function (btn) {
+    this.root.querySelectorAll('.gbk-reply-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var id = btn.getAttribute('data-id');
         var note = self.root.querySelector('.gbk-note[data-id="' + id + '"]');
         var slot = note.querySelector('.gbk-reply-slot');
-        if (slot.firstChild) {
-          slot.innerHTML = '';
-          return;
-        }
+        if (slot.firstChild) { slot.innerHTML = ''; return; }
         var key = 'reply-' + id;
         slot.innerHTML = self.formHtml(key, 'Write a reply', id);
         self.wireForm(key, parseInt(id, 10));
@@ -301,29 +268,24 @@
     injectStyles();
     var root =
       (targetId && document.getElementById(targetId)) ||
-      document.getElementById('bearblog-guestbook') ||
+      document.getElementById('bearblog-comments') ||
+      document.getElementById('comments') ||
       document.getElementById('guestbook');
     if (!root) {
-      // Fall back to inserting right after the script tag.
       root = document.createElement('div');
       if (script && script.parentNode) script.parentNode.insertBefore(root, script.nextSibling);
       else document.body.appendChild(root);
     }
+    if (!siteId) { root.textContent = 'Comments misconfigured: missing data-site-id.'; return; }
 
-    api('/api/config', {})
+    api('/api/config?site_id=' + encodeURIComponent(siteId), {})
       .then(function (config) {
         var go = function () { new GuestBook(root, config); };
-        if (config.siteKey) loadTurnstile().then(go);
-        else go();
+        if (config.turnstile_site_key) loadTurnstile().then(go); else go();
       })
-      .catch(function () {
-        root.textContent = 'Guestbook is unavailable right now.';
-      });
+      .catch(function () { root.textContent = 'Comments are unavailable right now.'; });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();

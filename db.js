@@ -7,27 +7,19 @@ const pool = new Pool({
   ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : false,
 });
 
-// Create the schema on boot. One self-referencing table handles both
-// top-level guestbook notes (parent_id IS NULL) and replies (parent_id set).
+// The schema is now owned by SQL migrations (see migrations/, run via
+// `npm run migrate up` as a Railway predeploy step) rather than created at
+// boot. Creating tables on boot races when multiple instances start at once.
+// init() just confirms the database is reachable so the healthcheck can flip
+// `dbReady` true once connections work.
 async function init() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS notes (
-      id         SERIAL PRIMARY KEY,
-      name       TEXT NOT NULL,
-      body       TEXT NOT NULL,
-      parent_id  INTEGER REFERENCES notes(id) ON DELETE CASCADE,
-      is_owner   BOOLEAN NOT NULL DEFAULT FALSE,
-      hidden     BOOLEAN NOT NULL DEFAULT FALSE,
-      ip_hash    TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS notes_parent_idx ON notes (parent_id);`
-  );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS notes_created_idx ON notes (created_at DESC);`
-  );
+  await pool.query('SELECT 1');
 }
 
-module.exports = { pool, init };
+// Thin query helper. Every comments query MUST be scoped by site_id_fk — see
+// models.js for the site-scoped accessors that enforce this.
+function query(text, params) {
+  return pool.query(text, params);
+}
+
+module.exports = { pool, init, query };

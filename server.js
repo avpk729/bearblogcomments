@@ -7,122 +7,112 @@ const crypto = require('crypto');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 
-const { pool, init } = require('./db');
+const { init } = require('./db');
+const models = require('./models');
 
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy; needed for real client IPs.
-app.use(express.json({ limit: '16kb' }));
+
+// NOTE: the Stripe webhook (added in the billing phase) must be mounted with
+// express.raw BEFORE this global JSON parser, or signature verification breaks.
+app.use(express.json({ limit: '32kb' }));
 
 // ---- Config ----
 const PORT = process.env.PORT || 3000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
-const MAX_NAME_LENGTH = parseInt(process.env.MAX_NAME_LENGTH || '50', 10);
-const MAX_BODY_LENGTH = parseInt(process.env.MAX_BODY_LENGTH || '280', 10);
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const IP_HASH_SALT = process.env.IP_HASH_SALT || process.env.SESSION_SECRET || 'dev-salt';
 
-if (!ADMIN_TOKEN) {
-  console.warn('[guestbook] WARNING: ADMIN_TOKEN is not set. Moderation is disabled until you set it.');
-}
 if (!TURNSTILE_SECRET_KEY) {
-  console.warn('[guestbook] WARNING: TURNSTILE_SECRET_KEY is not set. Captcha verification is DISABLED (dev mode).');
+  console.warn('[comments] WARNING: TURNSTILE_SECRET_KEY not set. Captcha verification is DISABLED (dev mode).');
 }
 
-// ---- CORS (so the embed script on your blog can talk to this API) ----
+// ---- CORS ----
+// Published comments are public and embeds live on arbitrary customer domains,
+// so reads/writes allow any origin. CORS is NOT the security boundary for
+// writes — site-exists + paid + Turnstile + rate limit are. No credentials are
+// used cross-origin (the owner dashboard is same-origin).
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.includes('*')) {
-    res.set('Access-Control-Allow-Origin', '*');
-  } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
-    res.set('Access-Control-Allow-Origin', origin);
-    res.set('Vary', 'Origin');
-  }
-  res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token');
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 // ---- Helpers ----
 function hashIp(ip) {
-  // Store a salted hash, never the raw IP, so we can rate-limit/dedupe
-  // without holding personal data.
-  return crypto
-    .createHash('sha256')
-    .update((ip || '') + '|' + (ADMIN_TOKEN || 'salt'))
-    .digest('hex')
-    .slice(0, 32);
+  return crypto.createHash('sha256').update((ip || '') + '|' + IP_HASH_SALT).digest('hex').slice(0, 32);
 }
 
-async function verifyTurnstile(token, ip) {
+async function verifyTurnstile(token, ip, site) {
   if (!TURNSTILE_SECRET_KEY) return true; // dev mode: no captcha configured
   if (!token) return false;
   try {
-    const resp = await fetch(
-      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          secret: TURNSTILE_SECRET_KEY,
-          response: token,
-          remoteip: ip || '',
-        }),
-      }
-    );
+    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token, remoteip: ip || '' }),
+    });
     const data = await resp.json();
-    return data.success === true;
+    if (data.success !== true) return false;
+    // One Turnstile widget serves every customer domain (hostname validation is
+    // disabled in Cloudflare), so enforce the hostname here against the site's
+    // registered domains. Empty domains[] = accept any (owner hasn't locked down).
+    const domains = (site && site.domains) || [];
+    if (domains.length && data.hostname && !domains.includes(data.hostname)) return false;
+    return true;
   } catch (err) {
-    console.error('[guestbook] Turnstile verify failed:', err);
+    console.error('[comments] Turnstile verify failed:', err);
     return false;
   }
 }
 
-// Plain text only: collapse excessive blank lines, trim, enforce length.
 function cleanText(value, max) {
   if (typeof value !== 'string') return '';
   return value.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, max);
 }
 
-function requireAdmin(req, res, next) {
-  const token = req.get('X-Admin-Token') || '';
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-}
-
-// Shape DB rows into a 2-level tree: top-level notes, each with replies.
+// Shape flat rows into a 2-level tree: top-level notes, each with replies.
 function buildTree(rows) {
   const byId = new Map();
   const roots = [];
-  for (const r of rows) {
-    byId.set(r.id, { ...r, replies: [] });
-  }
+  for (const r of rows) byId.set(r.id, { ...r, replies: [] });
   for (const r of rows) {
     const node = byId.get(r.id);
-    if (r.parent_id && byId.has(r.parent_id)) {
-      byId.get(r.parent_id).replies.push(node);
-    } else {
-      roots.push(node);
-    }
+    if (r.parent_id && byId.has(r.parent_id)) byId.get(r.parent_id).replies.push(node);
+    else roots.push(node);
   }
-  // Newest notes first; replies oldest first (conversation order).
-  roots.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  for (const root of roots) {
-    root.replies.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-  }
+  roots.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); // newest first
+  for (const root of roots) root.replies.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   return roots;
+}
+
+// Resolve the site for a request from its public site_id (query or body).
+async function loadSite(req, res) {
+  const siteId = (req.query.site_id || (req.body && req.body.site_id) || '').toString();
+  const site = await models.getSiteByPublicId(siteId);
+  if (!site) {
+    res.status(404).json({ error: 'Unknown site.' });
+    return null;
+  }
+  return site;
+}
+
+// Derive the thread key from request params (mode/page_url/thread_key override).
+function threadKeyFromReq(site, src) {
+  return models.deriveThreadKey({
+    siteId: site.site_id,
+    mode: src.mode || models.GUESTBOOK,
+    pageUrl: src.page_url,
+    override: src.thread_key,
+  });
 }
 
 // ---- Rate limiting on writes ----
 const postLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 5, // max 5 submissions per minute per IP
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many submissions. Please wait a minute and try again.' },
@@ -130,190 +120,123 @@ const postLimiter = rateLimit({
 
 // ===================== Public API =====================
 
-// Public config the embed script needs (safe to expose).
-app.get('/api/config', (req, res) => {
-  res.json({
-    siteKey: TURNSTILE_SITE_KEY,
-    maxName: MAX_NAME_LENGTH,
-    maxBody: MAX_BODY_LENGTH,
-  });
-});
-
-// List visible notes + replies.
-app.get('/api/notes', async (req, res) => {
+// Public config the embed needs (safe to expose). public_key/key_version are
+// added in the E2EE phase.
+app.get('/api/config', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, name, body, parent_id, is_owner, created_at
-         FROM notes
-        WHERE hidden = FALSE
-        ORDER BY created_at ASC`
-    );
-    res.json({ notes: buildTree(rows) });
+    const site = await loadSite(req, res);
+    if (!site) return;
+    res.json({
+      site_id: site.site_id,
+      turnstile_site_key: TURNSTILE_SITE_KEY,
+      max_name: site.max_name_length,
+      max_body: site.max_body_length,
+      accepting: models.siteAccepting(site),
+    });
   } catch (err) {
-    console.error('[guestbook] list error:', err);
-    res.status(500).json({ error: 'Could not load the guestbook.' });
+    console.error('[comments] config error:', err);
+    res.status(500).json({ error: 'Could not load config.' });
   }
 });
 
-// Create a note or a reply (visitor).
-app.post('/api/notes', postLimiter, async (req, res) => {
+// List published comments for a thread.
+app.get('/api/comments', async (req, res) => {
   try {
+    const site = await loadSite(req, res);
+    if (!site) return;
+    let threadKey;
+    try {
+      threadKey = threadKeyFromReq(site, req.query);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    const rows = await models.listPublishedThread(site.id, threadKey);
+    res.json({ comments: buildTree(rows) });
+  } catch (err) {
+    console.error('[comments] list error:', err);
+    res.status(500).json({ error: 'Could not load comments.' });
+  }
+});
+
+// Create a comment or reply.
+//
+// PHASE 1 BEHAVIOR: stores the comment as published plaintext immediately, to
+// verify multi-tenant routing without crypto. The E2EE phase changes this to
+// store ciphertext as 'pending' for owner moderation.
+app.post('/api/comments', postLimiter, async (req, res) => {
+  try {
+    const site = await loadSite(req, res);
+    if (!site) return;
+    if (!models.siteAccepting(site)) {
+      return res.status(402).json({ error: 'This site is not currently accepting comments.' });
+    }
+
     const { name, body, parent_id, website, turnstileToken } = req.body || {};
 
     // Honeypot: real users never fill this hidden field.
     if (website) return res.status(400).json({ error: 'Spam detected.' });
 
     const ip = req.ip;
-    const ok = await verifyTurnstile(turnstileToken, ip);
+    const ok = await verifyTurnstile(turnstileToken, ip, site);
     if (!ok) return res.status(400).json({ error: 'Human verification failed. Please try again.' });
 
-    const cleanName = cleanText(name, MAX_NAME_LENGTH) || 'Anonymous';
-    const cleanBody = cleanText(body, MAX_BODY_LENGTH);
-    if (!cleanBody) return res.status(400).json({ error: 'Your note is empty.' });
+    const cleanName = cleanText(name, site.max_name_length) || 'Anonymous';
+    const cleanBody = cleanText(body, site.max_body_length);
+    if (!cleanBody) return res.status(400).json({ error: 'Your comment is empty.' });
 
-    // Resolve the parent so threads never go deeper than 2 levels:
-    // a reply to a reply attaches to the original top-level note.
-    let resolvedParent = null;
-    if (parent_id) {
-      const { rows } = await pool.query(
-        `SELECT id, parent_id FROM notes WHERE id = $1 AND hidden = FALSE`,
-        [parent_id]
-      );
-      if (!rows.length) return res.status(400).json({ error: 'That note no longer exists.' });
-      resolvedParent = rows[0].parent_id || rows[0].id;
+    let threadKey, resolvedParent;
+    try {
+      threadKey = threadKeyFromReq(site, req.body);
+      resolvedParent = await models.resolveParent(site.id, threadKey, parent_id);
+    } catch (e) {
+      return res.status(400).json({ error: e.message === 'parent not found' ? 'That comment no longer exists.' : e.message });
     }
 
-    const { rows } = await pool.query(
-      `INSERT INTO notes (name, body, parent_id, is_owner, ip_hash)
-       VALUES ($1, $2, $3, FALSE, $4)
-       RETURNING id, name, body, parent_id, is_owner, created_at`,
-      [cleanName, cleanBody, resolvedParent, hashIp(ip)]
-    );
-    res.status(201).json({ note: rows[0] });
+    await models.insertComment({
+      siteFk: site.id,
+      threadKey,
+      parentId: resolvedParent,
+      status: 'published', // Phase 1 only — becomes 'pending' + ciphertext in the E2EE phase
+      isOwner: false,
+      name: cleanName,
+      body: cleanBody,
+      ipHash: hashIp(ip),
+      publishedAt: new Date(),
+    });
+    res.status(201).json({ ok: true });
   } catch (err) {
-    console.error('[guestbook] create error:', err);
-    res.status(500).json({ error: 'Could not save your note.' });
+    console.error('[comments] create error:', err);
+    res.status(500).json({ error: 'Could not save your comment.' });
   }
 });
 
-// ===================== Admin / Moderation API =====================
-
-// List everything, including hidden notes, for the moderation panel.
-app.get('/api/admin/notes', requireAdmin, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, body, parent_id, is_owner, hidden, created_at
-         FROM notes
-        ORDER BY created_at ASC`
-    );
-    res.json({ notes: buildTree(rows) });
-  } catch (err) {
-    console.error('[guestbook] admin list error:', err);
-    res.status(500).json({ error: 'Could not load notes.' });
-  }
-});
-
-// Owner reply (flagged is_owner = true).
-app.post('/api/admin/notes/:id/reply', requireAdmin, async (req, res) => {
-  try {
-    const parentId = parseInt(req.params.id, 10);
-    const cleanBody = cleanText((req.body || {}).body, MAX_BODY_LENGTH);
-    if (!cleanBody) return res.status(400).json({ error: 'Reply is empty.' });
-
-    const { rows: parents } = await pool.query(
-      `SELECT id, parent_id FROM notes WHERE id = $1`,
-      [parentId]
-    );
-    if (!parents.length) return res.status(404).json({ error: 'Note not found.' });
-    const resolvedParent = parents[0].parent_id || parents[0].id;
-
-    const ownerName = cleanText((req.body || {}).name, MAX_NAME_LENGTH) || 'Owner';
-    const { rows } = await pool.query(
-      `INSERT INTO notes (name, body, parent_id, is_owner)
-       VALUES ($1, $2, $3, TRUE)
-       RETURNING id, name, body, parent_id, is_owner, created_at`,
-      [ownerName, cleanBody, resolvedParent]
-    );
-    res.status(201).json({ note: rows[0] });
-  } catch (err) {
-    console.error('[guestbook] admin reply error:', err);
-    res.status(500).json({ error: 'Could not post reply.' });
-  }
-});
-
-// Soft-delete (hide). Hiding a top-level note also hides its replies.
-app.delete('/api/admin/notes/:id', requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    await pool.query(
-      `UPDATE notes SET hidden = TRUE WHERE id = $1 OR parent_id = $1`,
-      [id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('[guestbook] admin delete error:', err);
-    res.status(500).json({ error: 'Could not delete note.' });
-  }
-});
-
-// Restore a hidden note.
-app.post('/api/admin/notes/:id/restore', requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    await pool.query(`UPDATE notes SET hidden = FALSE WHERE id = $1`, [id]);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('[guestbook] admin restore error:', err);
-    res.status(500).json({ error: 'Could not restore note.' });
-  }
-});
-
-// Permanently delete.
-app.delete('/api/admin/notes/:id/purge', requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    await pool.query(`DELETE FROM notes WHERE id = $1`, [id]);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('[guestbook] admin purge error:', err);
-    res.status(500).json({ error: 'Could not purge note.' });
-  }
-});
-
-// ---- Static files (standalone page, admin page, embed script) ----
+// ---- Static files (standalone page, dashboard, embed script) ----
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Clean URL for the moderation panel.
-app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-// Liveness check. Stays up even while the DB is still connecting so the
-// platform healthcheck passes and we can read startup logs.
+// Liveness check. Stays up while the DB is still connecting so the platform
+// healthcheck passes and we can read startup logs.
 let dbReady = false;
 app.get('/healthz', (req, res) => res.json({ ok: true, db: dbReady }));
 
-// Start serving immediately so /healthz responds right away.
 app.listen(PORT, () => {
-  console.log(`[guestbook] listening on port ${PORT}`);
+  console.log(`[comments] listening on port ${PORT}`);
   if (!process.env.DATABASE_URL) {
-    console.warn('[guestbook] WARNING: DATABASE_URL is not set. Add a Postgres plugin and reference its variable.');
+    console.warn('[comments] WARNING: DATABASE_URL is not set.');
   }
 });
 
 // Connect to Postgres in the background, retrying instead of crashing.
-// A transient DB hiccup at boot shouldn't take down the whole service.
 async function connectWithRetry(attempt = 1) {
   try {
     await init();
     dbReady = true;
-    console.log('[guestbook] database ready');
+    console.log('[comments] database ready');
   } catch (err) {
     const delay = Math.min(30000, 2000 * 2 ** (attempt - 1));
-    console.error(
-      `[guestbook] database init failed (attempt ${attempt}): ${err.message}. Retrying in ${delay}ms`
-    );
+    console.error(`[comments] database init failed (attempt ${attempt}): ${err.message}. Retrying in ${delay}ms`);
     setTimeout(() => connectWithRetry(attempt + 1), delay);
   }
 }
 connectWithRetry();
+
+module.exports = app;

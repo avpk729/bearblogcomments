@@ -4,6 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
+    "preDeployCommand": "npm run migrate up",
     "startCommand": "npm start",
     "healthcheckPath": "/healthz",
     "restartPolicyType": "ON_FAILURE",

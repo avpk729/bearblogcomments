@@ -1,21 +1,30 @@
 {
-  "name": "bearblog-guestbook",
-  "version": "1.0.0",
-  "description": "A minimal guestbook for a Bear Blog: Twitter-style notes with replies, Turnstile captcha, and owner moderation. Backed by Postgres, deployable on Railway.",
+  "name": "bearblog-comments",
+  "version": "2.0.0",
+  "description": "Paid, multi-tenant, end-to-end-encrypted comments and guestbook for Bear Blog (and any site). Express + Postgres, deployable on Railway.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "migrate": "node scripts/migrate.js",
+    "migrate:make": "node scripts/migrate.js create"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
-    "pg": "^8.12.0"
+    "node-pg-migrate": "^7.6.1",
+    "nodemailer": "^6.9.15",
+    "pg": "^8.12.0",
+    "stripe": "^17.3.0"
+  },
+  "devDependencies": {
+    "libsodium-wrappers-sumo": "^0.7.15"
   },
   "license": "MIT"
 }
