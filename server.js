@@ -131,12 +131,18 @@ app.get('/api/config', async (req, res) => {
   try {
     const site = await loadSite(req, res);
     if (!site) return;
+    const key = await models.getCurrentSiteKey(site.id);
     res.json({
       site_id: site.site_id,
       turnstile_site_key: TURNSTILE_SITE_KEY,
       max_name: site.max_name_length,
       max_body: site.max_body_length,
       accepting: models.siteAccepting(site),
+      // E2EE: the public key visitors seal their comments to. Null until the
+      // owner has set an encryption passphrase.
+      encryption_ready: !!key,
+      public_key: key ? key.public_key : null,
+      key_version: key ? key.version : null,
     });
   } catch (err) {
     console.error('[comments] config error:', err);
@@ -163,11 +169,13 @@ app.get('/api/comments', async (req, res) => {
   }
 });
 
-// Create a comment or reply.
+// Create a comment or reply (E2EE).
 //
-// PHASE 1 BEHAVIOR: stores the comment as published plaintext immediately, to
-// verify multi-tenant routing without crypto. The E2EE phase changes this to
-// store ciphertext as 'pending' for owner moderation.
+// The body arrives already SEALED in the visitor's browser to the site's public
+// key — the server only stores ciphertext as 'pending'. It cannot read the
+// content; the owner decrypts and publishes from their dashboard. Anti-spam
+// (honeypot/Turnstile/rate limit) operates on the envelope, not the content.
+const MAX_CIPHERTEXT = 8192; // base64 of a sealed {name,body} is small; cap to prevent abuse
 app.post('/api/comments', postLimiter, async (req, res) => {
   try {
     const site = await loadSite(req, res);
@@ -176,7 +184,7 @@ app.post('/api/comments', postLimiter, async (req, res) => {
       return res.status(402).json({ error: 'This site is not currently accepting comments.' });
     }
 
-    const { name, body, parent_id, website, turnstileToken } = req.body || {};
+    const { ciphertext, key_version, parent_id, website, turnstileToken } = req.body || {};
 
     // Honeypot: real users never fill this hidden field.
     if (website) return res.status(400).json({ error: 'Spam detected.' });
@@ -185,9 +193,16 @@ app.post('/api/comments', postLimiter, async (req, res) => {
     const ok = await verifyTurnstile(turnstileToken, ip, site);
     if (!ok) return res.status(400).json({ error: 'Human verification failed. Please try again.' });
 
-    const cleanName = cleanText(name, site.max_name_length) || 'Anonymous';
-    const cleanBody = cleanText(body, site.max_body_length);
-    if (!cleanBody) return res.status(400).json({ error: 'Your comment is empty.' });
+    const key = await models.getCurrentSiteKey(site.id);
+    if (!key) return res.status(409).json({ error: 'This site has not finished encryption setup.' });
+
+    if (typeof ciphertext !== 'string' || !ciphertext || ciphertext.length > MAX_CIPHERTEXT) {
+      return res.status(400).json({ error: 'Invalid comment payload.' });
+    }
+    // Stale key (owner rotated since the page loaded): tell the client to refetch.
+    if (key_version && key_version !== key.version) {
+      return res.status(409).json({ error: 'Encryption key changed — please reload and try again.' });
+    }
 
     let threadKey, resolvedParent;
     try {
@@ -201,14 +216,13 @@ app.post('/api/comments', postLimiter, async (req, res) => {
       siteFk: site.id,
       threadKey,
       parentId: resolvedParent,
-      status: 'published', // Phase 1 only — becomes 'pending' + ciphertext in the E2EE phase
+      status: 'pending',
       isOwner: false,
-      name: cleanName,
-      body: cleanBody,
+      ciphertext,
+      keyVersion: key.version,
       ipHash: hashIp(ip),
-      publishedAt: new Date(),
     });
-    res.status(201).json({ ok: true });
+    res.status(201).json({ pending: true });
   } catch (err) {
     console.error('[comments] create error:', err);
     res.status(500).json({ error: 'Could not save your comment.' });
@@ -314,6 +328,131 @@ app.patch('/api/sites/:siteId', auth.requireOwner, async (req, res) => {
   } catch (err) {
     console.error('[sites] update error:', err);
     res.status(500).json({ error: 'Could not update site.' });
+  }
+});
+
+// ===================== Owner: encryption keys + moderation =====================
+
+// Middleware: load a site owned by the session owner, or 404. Runs after
+// requireOwner. Attaches req.site.
+async function requireOwnedSite(req, res, next) {
+  try {
+    const site = await models.getOwnedSite(req.owner.id, req.params.siteId);
+    if (!site) return res.status(404).json({ error: 'Site not found.' });
+    req.site = site;
+    next();
+  } catch (err) {
+    console.error('[sites] ownership check error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+}
+
+// Get the current site key (salt + KDF params + public key) so the owner's
+// browser can re-derive the keypair. Contains NO private material.
+app.get('/api/sites/:siteId/key', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const key = await models.getCurrentSiteKey(req.site.id);
+    if (!key) return res.status(404).json({ error: 'No key set.' });
+    res.json({ key });
+  } catch (err) {
+    console.error('[keys] get error:', err);
+    res.status(500).json({ error: 'Could not load key.' });
+  }
+});
+
+// Set the first key or rotate. The browser uploads only the PUBLIC key, salt,
+// and KDF params — never the passphrase or private key.
+app.post('/api/sites/:siteId/key', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const { public_key, salt, kdf_opslimit, kdf_memlimit, kdf_algo } = req.body || {};
+    if (typeof public_key !== 'string' || public_key.length < 20 || public_key.length > 100 ||
+        typeof salt !== 'string' || salt.length < 10 || salt.length > 100 ||
+        !Number.isInteger(kdf_opslimit) || !Number.isInteger(kdf_memlimit)) {
+      return res.status(400).json({ error: 'Invalid key material.' });
+    }
+    const key = await models.createSiteKey(req.site.id, {
+      publicKey: public_key, salt, kdfOps: kdf_opslimit, kdfMem: kdf_memlimit, kdfAlgo: kdf_algo,
+    });
+    res.status(201).json({ key });
+  } catch (err) {
+    console.error('[keys] set error:', err);
+    res.status(500).json({ error: 'Could not save key.' });
+  }
+});
+
+// Pending (and rejected) ciphertext rows for the moderation queue. The owner's
+// browser decrypts these locally.
+app.get('/api/sites/:siteId/pending', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const rows = await models.listPendingForSite(req.site.id);
+    res.json({ pending: rows });
+  } catch (err) {
+    console.error('[mod] pending error:', err);
+    res.status(500).json({ error: 'Could not load pending comments.' });
+  }
+});
+
+// Publish a pending comment: the owner sends the decrypted plaintext, which then
+// becomes public. Ciphertext is dropped.
+app.post('/api/sites/:siteId/comments/:id/publish', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const name = cleanText((req.body && req.body.name) || '', req.site.max_name_length) || 'Anonymous';
+    const body = cleanText((req.body && req.body.body) || '', req.site.max_body_length);
+    if (!body) return res.status(400).json({ error: 'Decrypted comment is empty.' });
+    const ok = await models.publishComment(req.site.id, parseInt(req.params.id, 10), name, body);
+    if (!ok) return res.status(404).json({ error: 'Pending comment not found.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[mod] publish error:', err);
+    res.status(500).json({ error: 'Could not publish.' });
+  }
+});
+
+app.post('/api/sites/:siteId/comments/:id/reject', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const ok = await models.rejectComment(req.site.id, parseInt(req.params.id, 10));
+    if (!ok) return res.status(404).json({ error: 'Pending comment not found.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[mod] reject error:', err);
+    res.status(500).json({ error: 'Could not reject.' });
+  }
+});
+
+app.delete('/api/sites/:siteId/comments/:id', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const ok = await models.deleteComment(req.site.id, parseInt(req.params.id, 10));
+    if (!ok) return res.status(404).json({ error: 'Comment not found.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[mod] delete error:', err);
+    res.status(500).json({ error: 'Could not delete.' });
+  }
+});
+
+// Owner reply: published plaintext directly (the owner is the moderator), tagged
+// as the owner. Attaches to the target comment's thread, clamped to 2 levels.
+app.post('/api/sites/:siteId/comments/:id/reply', auth.requireOwner, requireOwnedSite, async (req, res) => {
+  try {
+    const parent = await models.getCommentById(req.site.id, parseInt(req.params.id, 10));
+    if (!parent) return res.status(404).json({ error: 'Comment not found.' });
+    const name = cleanText((req.body && req.body.name) || '', req.site.max_name_length) || 'Owner';
+    const body = cleanText((req.body && req.body.body) || '', req.site.max_body_length);
+    if (!body) return res.status(400).json({ error: 'Reply is empty.' });
+    await models.insertComment({
+      siteFk: req.site.id,
+      threadKey: parent.thread_key,
+      parentId: parent.parent_id || parent.id, // clamp to top-level
+      status: 'published',
+      isOwner: true,
+      name,
+      body,
+      publishedAt: new Date(),
+    });
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error('[mod] reply error:', err);
+    res.status(500).json({ error: 'Could not reply.' });
   }
 });
 

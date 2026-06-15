@@ -114,6 +114,22 @@
     });
   }
 
+  // Lazily load the crypto helper + libsodium (≈1MB) only when needed, so blog
+  // pages aren't slowed down until a visitor actually writes a comment.
+  var cryptoPromise = null;
+  function ensureCrypto() {
+    if (cryptoPromise) return cryptoPromise;
+    cryptoPromise = new Promise(function (resolve, reject) {
+      if (window.BBCrypto) return resolve(window.BBCrypto);
+      var s = document.createElement('script');
+      s.src = apiBase + '/crypto.js';
+      s.onload = function () { resolve(window.BBCrypto); };
+      s.onerror = function () { reject(new Error('Could not load encryption library.')); };
+      document.head.appendChild(s);
+    }).then(function (bb) { return bb.load(apiBase).then(function () { return bb; }); });
+    return cryptoPromise;
+  }
+
   function GuestBook(root, config) {
     this.root = root;
     this.config = config;
@@ -121,13 +137,26 @@
     this.render();
   }
 
+  GuestBook.prototype.canPost = function () {
+    return this.config.accepting && this.config.encryption_ready;
+  };
+
   GuestBook.prototype.render = function () {
     this.root.className = (this.root.className ? this.root.className + ' ' : '') + 'gbk';
-    var formOrNote = this.config.accepting
-      ? this.formHtml('main', mode === 'guestbook' ? 'Leave a note' : 'Leave a comment', null)
-      : '<p class="gbk-empty">This ' + (mode === 'guestbook' ? 'guestbook' : 'comment section') + ' is not accepting new entries right now.</p>';
+    var label = mode === 'guestbook' ? 'guestbook' : 'comment section';
+    var formOrNote;
+    if (this.canPost()) {
+      formOrNote = this.formHtml('main', mode === 'guestbook' ? 'Leave a note' : 'Leave a comment', null);
+    } else if (!this.config.encryption_ready) {
+      formOrNote = '<p class="gbk-empty">Comments aren’t enabled yet.</p>';
+    } else {
+      formOrNote = '<p class="gbk-empty">This ' + label + ' is not accepting new entries right now.</p>';
+    }
     this.root.innerHTML = formOrNote + '<div class="gbk-list"><p class="gbk-empty">Loading…</p></div>';
-    if (this.config.accepting) this.wireForm('main', null);
+    if (this.canPost()) {
+      this.wireForm('main', null);
+      ensureCrypto().catch(function () {}); // warm up in the background
+    }
     this.load();
   };
 
@@ -180,22 +209,30 @@
       if (!token) { msg.className = 'gbk-msg err'; msg.textContent = 'Please complete the human check.'; return; }
     }
 
-    var payload = threadParams();
-    payload.name = name;
-    payload.body = body;
-    payload.parent_id = parentId;
-    payload.website = website;
-    payload.turnstileToken = token;
-
     btn.disabled = true;
-    api('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    msg.className = 'gbk-msg'; msg.textContent = 'Encrypting…';
+
+    // Seal {name, body} in the browser to the owner's public key. The server
+    // only ever receives ciphertext.
+    ensureCrypto()
+      .then(function (bb) {
+        var ciphertext = bb.seal(self.config.public_key, { name: name, body: body });
+        var payload = threadParams();
+        payload.ciphertext = ciphertext;
+        payload.key_version = self.config.key_version;
+        payload.parent_id = parentId;
+        payload.website = website;
+        payload.turnstileToken = token;
+        return api('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      })
       .then(function () {
-        msg.className = 'gbk-msg ok'; msg.textContent = 'Posted — thanks!';
+        msg.className = 'gbk-msg ok';
+        msg.textContent = 'Thanks! Your comment is encrypted and awaiting the owner’s approval.';
         form.querySelector('.gbk-body').value = '';
         form.querySelector('.gbk-name').value = name;
         form.querySelector('.gbk-count').textContent = '0 / ' + self.config.max_body;
         if (self.config.turnstile_site_key && window.turnstile && self.widgets[key] != null) window.turnstile.reset(self.widgets[key]);
-        self.load();
+        // No list reload — the new comment stays hidden until approved.
       })
       .catch(function (err) { msg.className = 'gbk-msg err'; msg.textContent = err.message || 'Something went wrong.'; })
       .then(function () { btn.disabled = false; });
@@ -208,7 +245,7 @@
       .then(function (data) {
         var notes = data.comments || [];
         if (!notes.length) {
-          list.innerHTML = '<p class="gbk-empty">No comments yet.' + (self.config.accepting ? ' Be the first!' : '') + '</p>';
+          list.innerHTML = '<p class="gbk-empty">No comments yet.' + (self.canPost() ? ' Be the first!' : '') + '</p>';
           return;
         }
         list.innerHTML = notes.map(function (n) { return self.noteHtml(n); }).join('');
@@ -224,7 +261,7 @@
       '<div class="gbk-note" data-id="' + n.id + '">' +
       '<div class="gbk-meta">' + this.metaHtml(n) + '</div>' +
       '<div class="gbk-text">' + textToHtml(n.body) + '</div>' +
-      (this.config.accepting ? '<div class="gbk-actions"><button class="gbk-link gbk-reply-btn" data-id="' + n.id + '">Reply</button></div>' : '') +
+      (this.canPost() ? '<div class="gbk-actions"><button class="gbk-link gbk-reply-btn" data-id="' + n.id + '">Reply</button></div>' : '') +
       '<div class="gbk-reply-slot"></div>' +
       (replies ? '<div class="gbk-replies">' + replies + '</div>' : '') +
       '</div>'

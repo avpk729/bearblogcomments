@@ -118,6 +118,54 @@ function siteAccepting(site) {
   return ['active', 'lifetime', 'past_due'].includes(site.plan_status);
 }
 
+// ── Site keys (E2EE) ────────────────────────────────────────────────────────
+
+// The current (un-retired) key for a site, or null if the owner hasn't set one.
+async function getCurrentSiteKey(siteFk) {
+  const { rows } = await pool.query(
+    `SELECT version, public_key, salt, kdf_algo, kdf_opslimit, kdf_memlimit
+       FROM site_keys
+      WHERE site_id_fk = $1 AND retired_at IS NULL
+      ORDER BY version DESC LIMIT 1`,
+    [siteFk]
+  );
+  return rows[0] || null;
+}
+
+// Create the first key (v1) or rotate: retire the current key and add the next
+// version. Old pending ciphertext keeps its key_version so it can still be
+// decrypted with the matching (old) passphrase.
+async function createSiteKey(siteFk, { publicKey, salt, kdfOps, kdfMem, kdfAlgo }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: vr } = await client.query(
+      `SELECT COALESCE(MAX(version), 0) AS max FROM site_keys WHERE site_id_fk = $1`,
+      [siteFk]
+    );
+    const nextVersion = Number(vr[0].max) + 1;
+    await client.query(
+      `UPDATE site_keys SET retired_at = now()
+        WHERE site_id_fk = $1 AND retired_at IS NULL`,
+      [siteFk]
+    );
+    const { rows } = await client.query(
+      `INSERT INTO site_keys
+         (site_id_fk, version, public_key, salt, kdf_algo, kdf_opslimit, kdf_memlimit)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING version, public_key, salt, kdf_algo, kdf_opslimit, kdf_memlimit`,
+      [siteFk, nextVersion, publicKey, salt, kdfAlgo || 'argon2id13', kdfOps, kdfMem]
+    );
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 // ── Comments (all scoped by site_id_fk) ─────────────────────────────────────
 
 async function listPublishedThread(siteFk, threadKey) {
@@ -197,6 +245,16 @@ async function rejectComment(siteFk, id) {
   return rowCount > 0;
 }
 
+// Fetch a single comment scoped to a site (for owner reply targeting).
+async function getCommentById(siteFk, id) {
+  const { rows } = await pool.query(
+    `SELECT id, thread_key, parent_id, status FROM comments
+      WHERE id = $1 AND site_id_fk = $2`,
+    [id, siteFk]
+  );
+  return rows[0] || null;
+}
+
 async function deleteComment(siteFk, id) {
   // Cascade handles replies via the self-referencing FK.
   const { rowCount } = await pool.query(
@@ -211,6 +269,7 @@ module.exports = {
   normalizeUrl, deriveThreadKey,
   generateSiteId, getSiteByPublicId, siteAccepting,
   createSite, listSitesForOwner, getOwnedSite, updateSite,
-  listPublishedThread, resolveParent, insertComment,
+  getCurrentSiteKey, createSiteKey,
+  listPublishedThread, resolveParent, insertComment, getCommentById,
   listPendingForSite, publishComment, rejectComment, deleteComment,
 };
