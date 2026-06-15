@@ -39,7 +39,9 @@
     sodiumPromise = loadScript(base + '/vendor/libsodium-sumo.js')
       .then(function () { return loadScript(base + '/vendor/libsodium-wrappers.js'); })
       .then(function () { return window.sodium.ready; })
-      .then(function () { return window.sodium; });
+      // Resolve with BBCrypto (the high-level helper), not the raw sodium API,
+      // so callers can do BBCrypto.load().then(bb => bb.deriveKeypair(...)).
+      .then(function () { return window.BBCrypto; });
     return sodiumPromise;
   }
 
@@ -51,14 +53,17 @@
   }
 
   // Derive an X25519 keypair deterministically from a passphrase + salt.
+  // ops/mem are coerced to numbers — they may arrive as strings (Postgres
+  // returns bigint columns as JS strings), and libsodium needs real numbers or
+  // the derivation silently differs.
   function deriveKeypair(passphrase, saltB64, ops, mem) {
     var s = window.sodium;
     var seed = s.crypto_pwhash(
       s.crypto_box_SEEDBYTES,
       passphrase,
       s.from_base64(saltB64, b64()),
-      ops || DEFAULT_OPS,
-      mem || DEFAULT_MEM,
+      Number(ops) || DEFAULT_OPS,
+      Number(mem) || DEFAULT_MEM,
       s.crypto_pwhash_ALG_ARGON2ID13
     );
     var kp = s.crypto_box_seed_keypair(seed);
@@ -67,6 +72,18 @@
       privateKey: kp.privateKey,
       publicKeyB64: s.to_base64(kp.publicKey, b64()),
       seedB64: s.to_base64(seed, b64()), // for the optional recovery code
+    };
+  }
+
+  // Re-derive a keypair directly from a stored recovery seed (base64), for owners
+  // who saved their recovery code but forgot the passphrase.
+  function keypairFromSeed(seedB64) {
+    var s = window.sodium;
+    var kp = s.crypto_box_seed_keypair(s.from_base64(seedB64.trim(), b64()));
+    return {
+      publicKey: kp.publicKey,
+      privateKey: kp.privateKey,
+      publicKeyB64: s.to_base64(kp.publicKey, b64()),
     };
   }
 
@@ -93,6 +110,7 @@
     load: load,
     generateSalt: generateSalt,
     deriveKeypair: deriveKeypair,
+    keypairFromSeed: keypairFromSeed,
     seal: seal,
     open: open,
   };

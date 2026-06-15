@@ -24,7 +24,8 @@
     "stripe": "^17.3.0"
   },
   "devDependencies": {
-    "libsodium-wrappers-sumo": "^0.7.15"
+    "libsodium-wrappers-sumo": "^0.7.15",
+    "playwright": "^1.60.0"
   },
   "license": "MIT"
 }

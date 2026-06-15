@@ -134,8 +134,9 @@ function doSetup(site, el) {
     }).then(function () {
       offerRecovery(kp.seedB64);
       keys[site.site_id] = { keypair: kp };
+      // Transition straight to the (empty) moderation queue — its appearance is
+      // the success signal. (Setting a message here would be lost on re-render.)
       renderQueue(site, []);
-      msg.className = 'msg ok'; msg.textContent = 'Encryption enabled.';
     });
   }).catch(function (e) { msg.className = 'msg err'; msg.textContent = e.message || 'Setup failed.'; });
 }
@@ -159,11 +160,37 @@ function renderUnlock(site, key) {
     '<strong>Moderation</strong>' +
     '<p class="muted">Enter your passphrase to decrypt and review pending comments. It stays in this browser.</p>' +
     '<label>Passphrase</label><input type="password" class="unlock-pass" placeholder="your passphrase" />' +
-    '<div class="row" style="margin-top:0.6rem"><button class="primary unlock-go">Unlock</button></div>' +
+    '<div class="row" style="margin-top:0.6rem"><button class="primary unlock-go">Unlock</button>' +
+    '<button class="recover-toggle">Use recovery code</button></div>' +
+    '<div class="recover-box hidden" style="margin-top:0.6rem">' +
+    '<label>Recovery code (from the file you saved at setup)</label>' +
+    '<textarea class="recover-seed" rows="2" placeholder="paste your recovery code"></textarea>' +
+    '<div class="row" style="margin-top:0.5rem"><button class="primary recover-go">Recover &amp; unlock</button></div>' +
+    '</div>' +
     '<div class="msg unlock-msg"></div>';
   el.dataset.key = JSON.stringify(key);
   el.querySelector('.unlock-go').addEventListener('click', function () { doUnlock(site, el, key); });
   el.querySelector('.unlock-pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') doUnlock(site, el, key); });
+  el.querySelector('.recover-toggle').addEventListener('click', function () { el.querySelector('.recover-box').classList.toggle('hidden'); });
+  el.querySelector('.recover-go').addEventListener('click', function () { doRecover(site, el, key); });
+}
+
+function doRecover(site, el, key) {
+  var seed = el.querySelector('.recover-seed').value.trim();
+  var msg = el.querySelector('.unlock-msg');
+  if (!seed) { msg.className = 'msg err'; msg.textContent = 'Paste your recovery code.'; return; }
+  msg.className = 'msg'; msg.textContent = 'Checking recovery code…';
+  BBCrypto.load().then(function (bb) {
+    var kp;
+    try { kp = bb.keypairFromSeed(seed); }
+    catch (e) { msg.className = 'msg err'; msg.textContent = 'That recovery code is not valid.'; return; }
+    if (kp.publicKeyB64 !== key.public_key) {
+      msg.className = 'msg err'; msg.textContent = 'That recovery code does not match this site’s key.';
+      return;
+    }
+    keys[site.site_id] = { keypair: kp, key: key };
+    loadQueue(site);
+  }).catch(function (e) { msg.className = 'msg err'; msg.textContent = e.message || 'Recovery failed.'; });
 }
 
 function doUnlock(site, el, key) {
