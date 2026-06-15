@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Comments · Dashboard</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        margin: 0; padding: 2rem 1rem 4rem; background: #fff; color: #1a1a1a; line-height: 1.5;
+      }
+      @media (prefers-color-scheme: dark) { body { background: #16161a; color: #e8e8ea; } }
+      .wrap { max-width: 760px; margin: 0 auto; }
+      h1 { margin-top: 0; }
+      a { color: inherit; }
+      input, textarea, button { font: inherit; color: inherit; background: transparent; }
+      input, textarea {
+        padding: 0.5rem; border: 1px solid #999; border-radius: 8px; width: 100%;
+      }
+      button {
+        cursor: pointer; padding: 0.5rem 1rem; border: 1px solid currentColor;
+        border-radius: 8px;
+      }
+      button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+      button:hover { opacity: 0.85; }
+      .hidden { display: none; }
+      .card {
+        border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
+        padding: 1.1rem; margin-bottom: 1.1rem;
+      }
+      .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+      .muted { opacity: 0.65; font-size: 0.9rem; }
+      .badge { font-size: 0.72rem; border: 1px solid currentColor; border-radius: 999px; padding: 0.1rem 0.5rem; }
+      .badge.ok { color: #197a19; }
+      .badge.warn { color: #b45309; }
+      .badge.bad { color: #c0392b; }
+      pre {
+        background: rgba(128,128,128,0.12); padding: 0.75rem; border-radius: 8px;
+        overflow-x: auto; font-size: 0.82rem; white-space: pre-wrap; word-break: break-all;
+      }
+      .msg { font-size: 0.9rem; margin: 0.5rem 0; }
+      .msg.err { color: #c0392b; }
+      .msg.ok { color: #197a19; }
+      label { display: block; font-size: 0.85rem; margin: 0.6rem 0 0.2rem; opacity: 0.8; }
+      .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <!-- Logged-out view -->
+      <div id="login-view" class="hidden">
+        <h1>Comments dashboard</h1>
+        <p class="muted">Sign in with a magic link — no password needed.</p>
+        <div class="card">
+          <label for="email">Email</label>
+          <input id="email" type="email" placeholder="you@example.com" autocomplete="email" />
+          <div class="row" style="margin-top:0.75rem">
+            <button class="primary" id="send-link">Email me a sign-in link</button>
+          </div>
+          <div id="login-msg" class="msg"></div>
+        </div>
+      </div>
+
+      <!-- Logged-in view -->
+      <div id="app-view" class="hidden">
+        <div class="topbar">
+          <h1 style="margin:0">Your sites</h1>
+          <div class="row">
+            <span id="who" class="muted"></span>
+            <button id="logout">Sign out</button>
+          </div>
+        </div>
+
+        <div id="sites"></div>
+
+        <div class="card">
+          <strong>Add a site</strong>
+          <label for="site-name">Site name</label>
+          <input id="site-name" type="text" placeholder="My Blog" />
+          <label for="site-domains">Allowed domains (comma-separated, optional)</label>
+          <input id="site-domains" type="text" placeholder="myblog.bearblog.dev" />
+          <div class="row" style="margin-top:0.75rem">
+            <button class="primary" id="create-site">Create site</button>
+          </div>
+          <div id="create-msg" class="msg"></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/dashboard.js"></script>
+  </body>
+</html>

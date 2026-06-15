@@ -5,10 +5,13 @@ require('dotenv').config();
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
+const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 
 const { init } = require('./db');
 const models = require('./models');
+const auth = require('./auth');
+const mailer = require('./mailer');
 
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy; needed for real client IPs.
@@ -16,9 +19,11 @@ app.set('trust proxy', 1); // Railway sits behind a proxy; needed for real clien
 // NOTE: the Stripe webhook (added in the billing phase) must be mounted with
 // express.raw BEFORE this global JSON parser, or signature verification breaks.
 app.use(express.json({ limit: '32kb' }));
+app.use(cookieParser());
 
 // ---- Config ----
 const PORT = process.env.PORT || 3000;
+const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/$/, '');
 const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 const IP_HASH_SALT = process.env.IP_HASH_SALT || process.env.SESSION_SECRET || 'dev-salt';
@@ -210,8 +215,113 @@ app.post('/api/comments', postLimiter, async (req, res) => {
   }
 });
 
+// ===================== Auth (magic link) =====================
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many sign-in attempts. Please wait and try again.' },
+});
+
+// Request a magic link. Always returns 200 so we never reveal which emails exist.
+app.post('/api/auth/magic-link', authLimiter, async (req, res) => {
+  try {
+    const email = (req.body && req.body.email) || '';
+    const owner = await auth.findOrCreateOwner(email);
+    if (owner) {
+      const raw = await auth.createMagicLink(owner.id);
+      const base = APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
+      const link = `${base}/api/auth/callback?token=${encodeURIComponent(raw)}`;
+      await mailer.sendMagicLink(owner.email, link, auth.MAGIC_LINK_TTL_MIN);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[auth] magic-link error:', err);
+    res.status(500).json({ error: 'Could not send sign-in link.' });
+  }
+});
+
+// Consume a magic link (top-level navigation from the email), set the session
+// cookie, and redirect to the dashboard.
+app.get('/api/auth/callback', async (req, res) => {
+  try {
+    const ownerId = await auth.consumeMagicLink(req.query.token);
+    if (!ownerId) return res.redirect('/dashboard?error=link');
+    const raw = await auth.createSession(ownerId);
+    auth.setSessionCookie(res, raw);
+    res.redirect('/dashboard');
+  } catch (err) {
+    console.error('[auth] callback error:', err);
+    res.redirect('/dashboard?error=server');
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    await auth.destroySession(req.cookies && req.cookies[auth.COOKIE_NAME]);
+  } catch (err) {
+    console.error('[auth] logout error:', err);
+  }
+  auth.clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// Current owner + their sites.
+app.get('/api/me', auth.requireOwner, async (req, res) => {
+  try {
+    const sites = await models.listSitesForOwner(req.owner.id);
+    res.json({ owner: { email: req.owner.email }, sites });
+  } catch (err) {
+    console.error('[auth] me error:', err);
+    res.status(500).json({ error: 'Could not load account.' });
+  }
+});
+
+// ===================== Owner: sites =====================
+
+function cleanDomains(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((d) => String(d || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''))
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
+app.post('/api/sites', auth.requireOwner, async (req, res) => {
+  try {
+    const name = cleanText((req.body && req.body.name) || '', 100) || 'My site';
+    const domains = cleanDomains(req.body && req.body.domains);
+    const site = await models.createSite(req.owner.id, name, domains);
+    res.status(201).json({ site });
+  } catch (err) {
+    console.error('[sites] create error:', err);
+    res.status(500).json({ error: 'Could not create site.' });
+  }
+});
+
+app.patch('/api/sites/:siteId', auth.requireOwner, async (req, res) => {
+  try {
+    const fields = {};
+    if (req.body && typeof req.body.name === 'string') fields.name = cleanText(req.body.name, 100) || 'My site';
+    if (req.body && Array.isArray(req.body.domains)) fields.domains = cleanDomains(req.body.domains);
+    if (req.body && Number.isInteger(req.body.max_body_length)) fields.max_body_length = Math.min(Math.max(req.body.max_body_length, 1), 5000);
+    if (req.body && Number.isInteger(req.body.max_name_length)) fields.max_name_length = Math.min(Math.max(req.body.max_name_length, 1), 200);
+    const site = await models.updateSite(req.owner.id, req.params.siteId, fields);
+    if (!site) return res.status(404).json({ error: 'Site not found.' });
+    res.json({ site });
+  } catch (err) {
+    console.error('[sites] update error:', err);
+    res.status(500).json({ error: 'Could not update site.' });
+  }
+});
+
 // ---- Static files (standalone page, dashboard, embed script) ----
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Clean URL for the owner dashboard.
+app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
 
 // Liveness check. Stays up while the DB is still connecting so the platform
 // healthcheck passes and we can read startup logs.

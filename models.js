@@ -53,9 +53,61 @@ function deriveThreadKey({ siteId, mode, pageUrl, override }) {
 
 // ── Sites ─────────────────────────────────────────────────────────────────
 
+// Public, unguessable site identifier that appears in the embed snippet.
+function generateSiteId() {
+  return crypto.randomBytes(16).toString('base64url');
+}
+
 async function getSiteByPublicId(siteId) {
   if (!siteId) return null;
   const { rows } = await pool.query('SELECT * FROM sites WHERE site_id = $1', [siteId]);
+  return rows[0] || null;
+}
+
+async function createSite(ownerId, name, domains) {
+  const siteId = generateSiteId();
+  const { rows } = await pool.query(
+    `INSERT INTO sites (owner_id, site_id, name, domains)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [ownerId, siteId, name, domains || []]
+  );
+  return rows[0];
+}
+
+async function listSitesForOwner(ownerId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM sites WHERE owner_id = $1 ORDER BY created_at ASC`,
+    [ownerId]
+  );
+  return rows;
+}
+
+// Fetch a site only if it belongs to this owner (per-tenant authorization).
+async function getOwnedSite(ownerId, siteId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM sites WHERE site_id = $1 AND owner_id = $2`,
+    [siteId, ownerId]
+  );
+  return rows[0] || null;
+}
+
+async function updateSite(ownerId, siteId, fields) {
+  const sets = [];
+  const vals = [];
+  let i = 1;
+  for (const [col, val] of Object.entries(fields)) {
+    sets.push(`${col} = $${i++}`);
+    vals.push(val);
+  }
+  if (!sets.length) return getOwnedSite(ownerId, siteId);
+  vals.push(siteId, ownerId);
+  const { rows } = await pool.query(
+    `UPDATE sites SET ${sets.join(', ')}
+      WHERE site_id = $${i++} AND owner_id = $${i}
+      RETURNING *`,
+    vals
+  );
   return rows[0] || null;
 }
 
@@ -157,7 +209,8 @@ async function deleteComment(siteFk, id) {
 module.exports = {
   GUESTBOOK, POST,
   normalizeUrl, deriveThreadKey,
-  getSiteByPublicId, siteAccepting,
+  generateSiteId, getSiteByPublicId, siteAccepting,
+  createSite, listSitesForOwner, getOwnedSite, updateSite,
   listPublishedThread, resolveParent, insertComment,
   listPendingForSite, publishComment, rejectComment, deleteComment,
 };
