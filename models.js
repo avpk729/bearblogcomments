@@ -243,6 +243,27 @@ async function insertComment(c) {
   return rows[0];
 }
 
+async function countPendingForSite(siteFk) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM comments WHERE site_id_fk = $1 AND status = 'pending'`,
+    [siteFk]
+  );
+  return rows[0].n;
+}
+
+// Delete pending/rejected comments older than `days`. We can't read ciphertext
+// to triage, so unmoderated pending is expired blindly to bound storage. Only
+// touches non-published rows, so live comments are never affected.
+async function expireOldModeration(days) {
+  const { rowCount } = await pool.query(
+    `DELETE FROM comments
+      WHERE status IN ('pending','rejected')
+        AND created_at < now() - ($1 || ' days')::interval`,
+    [String(days)]
+  );
+  return rowCount;
+}
+
 // Pending + rejected ciphertext rows for the owner's moderation queue. Never
 // includes plaintext (pending rows have none). Scoped to one site.
 async function listPendingForSite(siteFk) {
@@ -304,5 +325,6 @@ module.exports = {
   getOwnerById, setOwnerStripeCustomer, setSitePlanByPublicId, markStripeEvent,
   getCurrentSiteKey, createSiteKey,
   listPublishedThread, resolveParent, insertComment, getCommentById,
-  listPendingForSite, publishComment, rejectComment, deleteComment,
+  listPendingForSite, countPendingForSite, expireOldModeration,
+  publishComment, rejectComment, deleteComment,
 };

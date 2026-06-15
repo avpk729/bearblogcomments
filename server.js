@@ -30,6 +30,8 @@ const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/$/, '');
 const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 const IP_HASH_SALT = process.env.IP_HASH_SALT || process.env.SESSION_SECRET || 'dev-salt';
+const MAX_PENDING_PER_SITE = parseInt(process.env.MAX_PENDING_PER_SITE || '1000', 10);
+const PENDING_TTL_DAYS = parseInt(process.env.PENDING_TTL_DAYS || '45', 10);
 
 if (!TURNSTILE_SECRET_KEY) {
   console.warn('[comments] WARNING: TURNSTILE_SECRET_KEY not set. Captcha verification is DISABLED (dev mode).');
@@ -198,6 +200,11 @@ app.post('/api/comments', postLimiter, async (req, res) => {
 
     const key = await models.getCurrentSiteKey(site.id);
     if (!key) return res.status(409).json({ error: 'This site has not finished encryption setup.' });
+
+    // Bound the moderation backlog — we can't read ciphertext to triage spam.
+    if (await models.countPendingForSite(site.id) >= MAX_PENDING_PER_SITE) {
+      return res.status(429).json({ error: 'Too many comments are awaiting moderation. Please try again later.' });
+    }
 
     if (typeof ciphertext !== 'string' || !ciphertext || ciphertext.length > MAX_CIPHERTEXT) {
       return res.status(400).json({ error: 'Invalid comment payload.' });
@@ -581,5 +588,18 @@ async function connectWithRetry(attempt = 1) {
   }
 }
 connectWithRetry();
+
+// Periodically expire stale, never-moderated pending/rejected comments so the
+// backlog can't grow without bound (published comments are never touched).
+async function cleanupOldModeration() {
+  try {
+    const n = await models.expireOldModeration(PENDING_TTL_DAYS);
+    if (n) console.log(`[comments] expired ${n} pending/rejected comments older than ${PENDING_TTL_DAYS}d`);
+  } catch (e) {
+    console.error('[comments] cleanup error:', e.message);
+  }
+}
+setTimeout(cleanupOldModeration, 30 * 1000);
+setInterval(cleanupOldModeration, 6 * 60 * 60 * 1000);
 
 module.exports = app;
