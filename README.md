@@ -99,7 +99,20 @@ site's registered `domains` instead.
    key if you later rename a post's slug.
 
 3. Moderate at `/dashboard`: enter your passphrase to decrypt the queue, then
-   **Approve / Reject / Delete**, or reply as the owner.
+   **Approve / Reject / Delete** each pending comment.
+
+### Known follow-ups
+
+The API supports a couple of things the dashboard UI doesn't surface yet:
+
+- **Owner replies** — `POST /api/sites/:id/comments/:cid/reply` exists, but there's
+  no button for it in the dashboard yet.
+- **Un-publishing / managing published comments** — the queue shows only pending
+  items; removing an already-approved comment is possible via
+  `DELETE /api/sites/:id/comments/:cid` but not yet exposed in the UI.
+- **Key rotation UI** — `POST /api/sites/:id/key` rotates the key, but rotating
+  orphans existing pending ciphertext (sealed to the old key) until the dashboard
+  supports decrypting across key versions, so it isn't surfaced.
 
 ---
 

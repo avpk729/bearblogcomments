@@ -199,8 +199,12 @@ function renderUnlock(site, key) {
 }
 
 function doRecover(site, el, key) {
-  var seed = el.querySelector('.recover-seed').value.trim();
+  var raw = el.querySelector('.recover-seed').value || '';
   var msg = el.querySelector('.unlock-msg');
+  // Tolerate pasting the whole recovery FILE (prose header + the code): pull out
+  // the longest base64 token, which is the seed.
+  var tokens = raw.match(/[A-Za-z0-9+/]{40,}={0,2}/g);
+  var seed = tokens ? tokens.sort(function (a, b) { return b.length - a.length; })[0] : raw.trim();
   if (!seed) { msg.className = 'msg err'; msg.textContent = 'Paste your recovery code.'; return; }
   msg.className = 'msg'; msg.textContent = 'Checking recovery code…';
   BBCrypto.load().then(function (bb) {
