@@ -12,12 +12,15 @@ const { init } = require('./db');
 const models = require('./models');
 const auth = require('./auth');
 const mailer = require('./mailer');
+const billing = require('./billing');
 
 const app = express();
 app.set('trust proxy', 1); // Railway sits behind a proxy; needed for real client IPs.
 
-// NOTE: the Stripe webhook (added in the billing phase) must be mounted with
-// express.raw BEFORE this global JSON parser, or signature verification breaks.
+// The Stripe webhook needs the RAW body for signature verification, so it must
+// be mounted with express.raw BEFORE the global JSON parser below.
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleWebhook);
+
 app.use(express.json({ limit: '32kb' }));
 app.use(cookieParser());
 
@@ -455,6 +458,97 @@ app.post('/api/sites/:siteId/comments/:id/reply', auth.requireOwner, requireOwne
     res.status(500).json({ error: 'Could not reply.' });
   }
 });
+
+// ===================== Billing (Stripe) =====================
+
+function billingBaseUrl(req) {
+  return APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
+}
+
+app.post('/api/billing/checkout', auth.requireOwner, async (req, res) => {
+  if (!billing.billingConfigured()) return res.status(400).json({ error: 'Billing is not configured.' });
+  const { site_id, plan_kind } = req.body || {};
+  if (!['monthly', 'yearly', 'lifetime'].includes(plan_kind)) return res.status(400).json({ error: 'Invalid plan.' });
+  if (!billing.priceFor(plan_kind)) return res.status(400).json({ error: 'That plan is not available yet.' });
+  const site = await models.getOwnedSite(req.owner.id, site_id);
+  if (!site) return res.status(404).json({ error: 'Site not found.' });
+  try {
+    const owner = await models.getOwnerById(req.owner.id);
+    const customerId = await billing.ensureCustomer(owner, (cid) => models.setOwnerStripeCustomer(owner.id, cid));
+    const url = await billing.createCheckout({ owner, site, planKind: plan_kind, customerId, baseUrl: billingBaseUrl(req) });
+    res.json({ url });
+  } catch (e) {
+    console.error('[billing] checkout error:', e);
+    res.status(502).json({ error: 'Could not start checkout.' });
+  }
+});
+
+app.post('/api/billing/portal', auth.requireOwner, async (req, res) => {
+  if (!billing.billingConfigured()) return res.status(400).json({ error: 'Billing is not configured.' });
+  try {
+    const owner = await models.getOwnerById(req.owner.id);
+    if (!owner.stripe_customer_id) return res.status(400).json({ error: 'No billing account yet — subscribe first.' });
+    const url = await billing.createPortal({ customerId: owner.stripe_customer_id, baseUrl: billingBaseUrl(req) });
+    res.json({ url });
+  } catch (e) {
+    console.error('[billing] portal error:', e);
+    res.status(502).json({ error: 'Could not open billing portal.' });
+  }
+});
+
+// Webhook handler (mounted earlier with express.raw). Stripe is the source of
+// truth for access — the checkout redirect never grants it.
+async function handleWebhook(req, res) {
+  if (!billing.billingConfigured()) return res.status(400).send('billing not configured');
+  let event;
+  try {
+    event = billing.constructEvent(req.body, req.headers['stripe-signature']);
+  } catch (e) {
+    console.error('[stripe] signature verification failed:', e.message);
+    return res.status(400).send('bad signature');
+  }
+  try {
+    const fresh = await models.markStripeEvent(event.id, event.type);
+    if (!fresh) return res.json({ received: true, duplicate: true }); // already handled
+    await applyStripeEvent(event);
+  } catch (e) {
+    console.error('[stripe] handler error:', e);
+    return res.status(500).send('handler error');
+  }
+  res.json({ received: true });
+}
+
+async function applyStripeEvent(event) {
+  const obj = event.data.object;
+  if (event.type === 'checkout.session.completed') {
+    const siteId = obj.client_reference_id || (obj.metadata && obj.metadata.site_id);
+    if (!siteId) return;
+    if (obj.mode === 'payment') {
+      await models.setSitePlanByPublicId(siteId, { plan_status: 'lifetime', plan_kind: 'lifetime', current_period_end: null });
+    } else if (obj.mode === 'subscription') {
+      let periodEnd = null;
+      const subId = obj.subscription;
+      if (subId && billing.stripe) {
+        try { periodEnd = billing.periodEndFromSub(await billing.stripe.subscriptions.retrieve(subId)); } catch {}
+      }
+      await models.setSitePlanByPublicId(siteId, {
+        plan_status: 'active',
+        plan_kind: (obj.metadata && obj.metadata.plan_kind) || null,
+        current_period_end: periodEnd,
+        stripe_subscription_id: subId || null,
+      });
+    }
+  } else if (event.type === 'customer.subscription.updated') {
+    const siteId = obj.metadata && obj.metadata.site_id;
+    if (!siteId) return;
+    const status = (obj.status === 'active' || obj.status === 'trialing') ? 'active'
+      : (obj.status === 'past_due' || obj.status === 'unpaid') ? 'past_due' : 'canceled';
+    await models.setSitePlanByPublicId(siteId, { plan_status: status, current_period_end: billing.periodEndFromSub(obj) });
+  } else if (event.type === 'customer.subscription.deleted') {
+    const siteId = obj.metadata && obj.metadata.site_id;
+    if (siteId) await models.setSitePlanByPublicId(siteId, { plan_status: 'canceled' });
+  }
+}
 
 // ---- Static files (standalone page, dashboard, embed script) ----
 app.use(express.static(path.join(__dirname, 'public')));

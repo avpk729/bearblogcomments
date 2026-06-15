@@ -118,6 +118,38 @@ function siteAccepting(site) {
   return ['active', 'lifetime', 'past_due'].includes(site.plan_status);
 }
 
+// ── Billing ─────────────────────────────────────────────────────────────────
+
+async function getOwnerById(ownerId) {
+  const { rows } = await pool.query('SELECT * FROM owners WHERE id = $1', [ownerId]);
+  return rows[0] || null;
+}
+
+async function setOwnerStripeCustomer(ownerId, customerId) {
+  await pool.query('UPDATE owners SET stripe_customer_id = $2 WHERE id = $1', [ownerId, customerId]);
+}
+
+// Update a site's plan fields by its public id. Used by the webhook (system
+// context — not owner-scoped, since Stripe is the caller).
+async function setSitePlanByPublicId(siteId, fields) {
+  const sets = [], vals = [];
+  let i = 1;
+  for (const [col, val] of Object.entries(fields)) { sets.push(`${col} = $${i++}`); vals.push(val); }
+  if (!sets.length) return;
+  vals.push(siteId);
+  await pool.query(`UPDATE sites SET ${sets.join(', ')} WHERE site_id = $${i}`, vals);
+}
+
+// Record a Stripe event id; returns true if newly recorded, false if it was
+// already processed (so callers can skip duplicate deliveries).
+async function markStripeEvent(id, type) {
+  const { rowCount } = await pool.query(
+    `INSERT INTO stripe_events (id, type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+    [id, type]
+  );
+  return rowCount > 0;
+}
+
 // ── Site keys (E2EE) ────────────────────────────────────────────────────────
 
 // The current (un-retired) key for a site, or null if the owner hasn't set one.
@@ -269,6 +301,7 @@ module.exports = {
   normalizeUrl, deriveThreadKey,
   generateSiteId, getSiteByPublicId, siteAccepting,
   createSite, listSitesForOwner, getOwnedSite, updateSite,
+  getOwnerById, setOwnerStripeCustomer, setSitePlanByPublicId, markStripeEvent,
   getCurrentSiteKey, createSiteKey,
   listPublishedThread, resolveParent, insertComment, getCommentById,
   listPendingForSite, publishComment, rejectComment, deleteComment,

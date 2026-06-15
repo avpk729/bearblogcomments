@@ -54,6 +54,31 @@ function snippet(site, mode, targetId) {
   );
 }
 
+function fmtDate(iso) { try { return new Date(iso).toLocaleDateString(); } catch (e) { return ''; } }
+
+function billingHtml(site) {
+  var active = ['active', 'lifetime', 'past_due'].includes(site.plan_status);
+  if (site.plan_status === 'lifetime') {
+    return '<div class="msg ok">Lifetime access — thank you!</div>';
+  }
+  if (active) {
+    var until = site.current_period_end ? ' (renews ' + fmtDate(site.current_period_end) + ')' : '';
+    var warn = site.plan_status === 'past_due' ? '<div class="msg" style="color:#b45309">Payment past due — please update billing.</div>' : '';
+    return warn +
+      '<div class="row" style="margin:0.4rem 0"><span class="muted">Plan: ' + esc(site.plan_kind || 'active') + until + '</span>' +
+      '<button data-billing="portal" data-site="' + esc(site.site_id) + '">Manage billing</button></div>';
+  }
+  // Unpaid / cancelled → offer plans.
+  return (
+    '<div class="msg" style="opacity:.85">Not active yet — choose a plan to start accepting comments:</div>' +
+    '<div class="row" style="margin:0.4rem 0">' +
+    '<button data-billing="monthly" data-site="' + esc(site.site_id) + '">$5 / month</button>' +
+    '<button data-billing="yearly" data-site="' + esc(site.site_id) + '">$60 / year</button>' +
+    '<button class="primary" data-billing="lifetime" data-site="' + esc(site.site_id) + '">$150 lifetime</button>' +
+    '</div>'
+  );
+}
+
 function siteCard(site) {
   return (
     '<div class="card" data-site="' + esc(site.site_id) + '">' +
@@ -61,9 +86,7 @@ function siteCard(site) {
     '<strong>' + esc(site.name) + '</strong>' + planBadge(site) +
     '</div>' +
     '<div class="muted" style="margin:0.3rem 0">site id: <code>' + esc(site.site_id) + '</code></div>' +
-    (!['active', 'lifetime', 'past_due'].includes(site.plan_status)
-      ? '<div class="msg" style="opacity:.8">This site isn\'t active yet — it won\'t accept new comments until you subscribe (billing coming soon).</div>'
-      : '') +
+    billingHtml(site) +
     '<details><summary>Embed snippets</summary>' +
     '<label>Per-post comments (POST template):</label>' +
     '<pre>' + esc(snippet(site, 'post', 'comments')) + '</pre>' +
@@ -322,6 +345,20 @@ $('create-site').addEventListener('click', function () {
   api('/api/sites', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, domains: domains }),
   }).then(function () { window.location.reload(); }).catch(function (e) { m.className = 'msg err'; m.textContent = e.message; });
+});
+
+// Billing buttons (event-delegated, since cards render dynamically).
+$('sites').addEventListener('click', function (e) {
+  var btn = e.target.closest('button[data-billing]');
+  if (!btn) return;
+  var kind = btn.getAttribute('data-billing');
+  var siteId = btn.getAttribute('data-site');
+  btn.disabled = true;
+  var path = kind === 'portal' ? '/api/billing/portal' : '/api/billing/checkout';
+  var body = kind === 'portal' ? { site_id: siteId } : { site_id: siteId, plan_kind: kind };
+  api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { if (r.url) window.location = r.url; else { btn.disabled = false; alert('Could not start billing.'); } })
+    .catch(function (err) { btn.disabled = false; alert(err.message || 'Billing error.'); });
 });
 
 boot();
